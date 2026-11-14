@@ -2,6 +2,7 @@ package apollo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,15 +40,52 @@ func index(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, indexFile)
 }
 
+// scrapeFn is indirection over schema.Scrape so tests can exercise the HTTP
+// handler without relying on the package-wide (loopback-blocking) fetcher.
+var scrapeFn = schema.Scrape
+
+// scrapeErrorResponse is the stable error envelope returned by /scrape. Reason
+// is always one of the schema.Reason* constants, so clients can branch on it.
+type scrapeErrorResponse struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+	URL    string `json:"url"`
+}
+
 func scrape(w http.ResponseWriter, r *http.Request) {
-	linkToScraoe := r.FormValue("q")
+	linkToScrape := r.FormValue("q")
 	w.Header().Set("Content-Type", "application/json")
-	result, err := schema.Scrape(linkToScraoe)
+	result, err := scrapeFn(linkToScrape)
 	if err != nil {
-		log.Fatal("Error trying to scrape a digital artifact!")
-		w.WriteHeader(http.StatusExpectationFailed)
-	} else {
-		json.NewEncoder(w).Encode(result)
+		// A single bad or blocked link must never take the process down: log
+		// and answer with the structured rejection reason instead.
+		log.Printf("scrape rejected for %q: %v", linkToScrape, err)
+		resp := scrapeErrorResponse{Error: err.Error(), Reason: schema.ReasonFetchFailed, URL: linkToScrape}
+		var fetchErr *schema.FetchError
+		if errors.As(err, &fetchErr) {
+			resp.Reason = fetchErr.Reason
+			if fetchErr.URL != "" {
+				resp.URL = fetchErr.URL
+			}
+		}
+		w.WriteHeader(statusForScrapeReason(resp.Reason))
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	json.NewEncoder(w).Encode(result)
+}
+
+// statusForScrapeReason maps stable rejection reasons onto HTTP status codes.
+// Caller-side mistakes (bad URL, blocked host, redirect policy) are 4xx;
+// transport failures remain 417 as the original endpoint used.
+func statusForScrapeReason(reason string) int {
+	switch reason {
+	case schema.ReasonInvalidURL, schema.ReasonHostBlocked:
+		return http.StatusBadRequest
+	case schema.ReasonTooManyRedirects, schema.ReasonUnsupportedType, schema.ReasonResponseTooLarge:
+		return http.StatusUnprocessableEntity
+	default:
+		return http.StatusExpectationFailed
 	}
 }
 
@@ -134,14 +172,22 @@ func isValidPassword(password string) bool {
 }
 
 func Start() {
-	r := mux.NewRouter()
-	currentSearchResults = make(map[string]string)
 	srv := &http.Server{
-		Handler:      r,
+		Handler:      newRouter(),
 		Addr:         "0.0.0.0:8993",
 		WriteTimeout: 60 * time.Second,
 		ReadTimeout:  60 * time.Second,
 	}
+	log.Printf("Server listening on %s\n", srv.Addr)
+	log.Fatal(srv.ListenAndServe())
+
+}
+
+// newRouter wires every API route. It is split out of Start so httptest can
+// exercise the full handler stack without binding a network port.
+func newRouter() *mux.Router {
+	r := mux.NewRouter()
+	currentSearchResults = make(map[string]string)
 
 	//will need to some kind of API call to ingest data
 	r.Methods("POST").Path("/search").HandlerFunc(search)
@@ -151,7 +197,5 @@ func Start() {
 	r.Methods("POST").Path("/getRecordDetail").HandlerFunc(getRecord)
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
 	r.PathPrefix("/").HandlerFunc(index)
-	log.Printf("Server listening on %s\n", srv.Addr)
-	log.Fatal(srv.ListenAndServe())
-
+	return r
 }
